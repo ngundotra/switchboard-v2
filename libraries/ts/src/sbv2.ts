@@ -1653,45 +1653,88 @@ export class JobAccount {
     program: SwitchboardProgram,
     params: JobInitParams
   ): Promise<JobAccount> {
+    const CHUNK_SIZE = 800;
     const payerKeypair = programWallet(program);
     const jobAccount = params.keypair ?? anchor.web3.Keypair.generate();
-    const size =
-      280 + params.data.length + (params.variables?.join("")?.length ?? 0);
     const [stateAccount, stateBump] = await ProgramStateAccount.getOrCreate(
       program,
       {}
     );
     const state = await stateAccount.loadData();
-    await program.methods
-      .jobInit({
-        name: params.name ?? Buffer.from(""),
-        expiration: params.expiration ?? new anchor.BN(0),
-        data: params.data,
-        variables:
-          params.variables?.map((item) => Buffer.from("")) ??
-          new Array<Buffer>(),
-        stateBump,
-      })
-      .accounts({
-        job: jobAccount.publicKey,
-        authorWallet: params.authority,
-        authority: params.authority,
-        programState: stateAccount.publicKey,
-      })
-      .signers([jobAccount])
-      .preInstructions([
-        anchor.web3.SystemProgram.createAccount({
-          fromPubkey: programWallet(program).publicKey,
-          newAccountPubkey: jobAccount.publicKey,
-          space: size,
-          lamports:
-            await program.provider.connection.getMinimumBalanceForRentExemption(
-              size
-            ),
-          programId: program.programId,
-        }),
-      ])
-      .rpc();
+
+    if (params.data.byteLength <= CHUNK_SIZE) {
+      await program.methods
+        .jobInit({
+          name: params.name ?? Buffer.from(""),
+          expiration: params.expiration ?? new anchor.BN(0),
+          data: params.data,
+          variables:
+            params.variables?.map((item) => Buffer.from("")) ??
+            new Array<Buffer>(),
+          stateBump,
+          size: null,
+          chunkIdx: null,
+        })
+        .accounts({
+          job: jobAccount.publicKey,
+          authorWallet: params.authority,
+          authority: params.authority,
+          programState: stateAccount.publicKey,
+        })
+        .signers([jobAccount])
+        .rpc();
+    } else {
+      // chunk jobs
+      const chunks: Buffer[] = [];
+      for (let i = 0; i < params.data.byteLength; ) {
+        const end =
+          i + CHUNK_SIZE >= params.data.byteLength
+            ? params.data.byteLength
+            : i + CHUNK_SIZE;
+        chunks.push(params.data.slice(i, end));
+        i = end;
+      }
+      const txns: string[] = [];
+      for await (const [n, chunk] of chunks.entries()) {
+        if (n === 0) {
+          txns.push(
+            await program.methods
+              .jobInit({
+                name: [],
+                expiration: new anchor.BN(0),
+                data: chunk,
+                stateBump,
+                size: params.data.byteLength,
+                chunkIdx: n,
+              })
+              .accounts({
+                job: jobAccount.publicKey,
+                authority: payerKeypair.publicKey,
+                programState: stateAccount.publicKey,
+                payer: payerKeypair.publicKey,
+                systemProgram: anchor.web3.SystemProgram.programId,
+              })
+              .signers([jobAccount])
+              .rpc()
+          );
+        } else {
+          txns.push(
+            await program.methods
+              .jobSetData({
+                data: chunk,
+                size: params.data.byteLength,
+                chunkIdx: n,
+              })
+              .accounts({
+                job: jobAccount.publicKey,
+                authority: payerKeypair.publicKey,
+              })
+              .rpc()
+          );
+        }
+      }
+    }
+
     return new JobAccount({ program, keypair: jobAccount });
   }
 
